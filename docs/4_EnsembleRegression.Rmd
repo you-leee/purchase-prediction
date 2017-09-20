@@ -1,0 +1,347 @@
+---
+title: "Ensemble Regression"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 11, fig.height = 11)
+```
+
+As a last approach, we will try to fit an ensemble:
+In this ensemble, we will use both linear and nonlinear models along with kknn too, hoping to fit the non-linear relationships, what we have seen from earlier and push the model to separate customers, who didn't spent next year from the others
+We will also use some preprocessing, like scaling and removing near zero variance predictors and clean the dataset from too outstanding values before training
+
+```{r message = FALSE, warning = FALSE}
+library(MASS)
+library(car)
+library(kknn)
+library(mfp)
+library(splines)
+library(pscl)
+
+source("R/utils.R")
+source("R/RFM.R")
+source("R/featureScaling.R")
+source("R/modelFitting.R")
+
+# Load customer rfm values
+customer_rfm_2012 <- loadRFM(2012)
+customer_rfm_2013 <- loadRFM(2013)
+
+# Customer data, of spendings in 2012
+customer_total_sales_2013 <- customer_rfm_2013 %>% 
+  dplyr::select(contact_id, total_sales) %>%
+  rename(nexty_total_sales = total_sales)
+
+customers_2012 <- left_join(customer_rfm_2012, customer_total_sales_2013, by = "contact_id") %>% 
+  mutate_each(funs(replace(., which(is.na(.)), 0)))
+summary(customers_2012)
+```
+
+## Preprocess data
+###Remove near zero covariates and scale features
+
+```{r}
+print(pp <- preProcess(customers_2012[, -c(1, 7)], 
+                       method = c("nzv", "scale"),
+                       outcome = customers_2012[, 7]))
+```
+
+We can see, that active days was discarded and from the plot, that features are now scaled to a smaller range
+
+```{r}
+pp$method
+
+pp_customers_2012 <- data.frame(contact_id = customers_2012[, 1],
+                                 predict(pp, customers_2012[, -c(1,7)]),
+                                 nexty_total_sales = customers_2012[, 7])
+
+plotRfms(pp_customers_2012, c(100, 100, 100, 100, 100, 100), "rfmbn", "Customers preprocessed")
+```
+
+### Discarde points with too high leverage, influence 
+(in a linear model)
+
+```{r}
+set.seed(32)
+glm_model <- glm(nexty_total_sales ~ order_num + product_num + total_sales + days_since_last_purchase,
+                    data = pp_customers_2012)
+
+lev <- hat(model.matrix(glm_model))
+plot(lev)
+high_leverage_points <- as.numeric(row.names(pp_customers_2012[lev > 0.15,]))
+points(high_leverage_points, lev[high_leverage_points], col = 'red')
+
+cook <- cooks.distance(glm_model)
+plot(cook)
+points(high_leverage_points, cook[high_leverage_points], col = 'red')
+high_influence_points <- as.numeric(row.names(pp_customers_2012[cook > 150,]))
+
+outliners <- union(high_influence_points, high_leverage_points)
+pp_customers_2012[outliners,]
+
+pp_customers_2012 <- pp_customers_2012[-outliners,]
+```
+
+## Train
+For the ensemble we will use the following 4 models:
+
+* Gaussian linear model
+* Multiple Fractional Polynomial model
+* Polynomial Splines
+* Weighted k-Nearest Neighbor Regression model (for 2 clusters)
+
+```{r}
+set.seed(3456)
+trainIndex <- createDataPartition(pp_customers_2012$nexty_total_sales, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+
+customer_purchase_train <- pp_customers_2012[ trainIndex,]
+customer_purchase_test  <- pp_customers_2012[-trainIndex,]
+```
+
+#### Quasi-Poisson linear model
+
+```{r}
+set.seed(32)
+summary(glm_model <- glm(nexty_total_sales ~ order_num + product_num + total_sales + days_since_last_purchase,
+                         data = customer_purchase_train))
+```
+
+#### Multiple Fractional Polynomial model
+
+```{r}
+set.seed(32)
+summary(mfp_model <- mfp(nexty_total_sales ~ fp(order_num) + fp(product_num) + fp(total_sales) + fp(days_since_last_purchase), 
+                         data = customer_purchase_train))
+```
+
+#### Polynomial Splines
+
+```{r}
+set.seed(32)
+summary(spline_model <- lm(nexty_total_sales ~ bs(order_num) + bs(product_num) + bs(total_sales) + bs(days_since_last_purchase), 
+                         data = customer_purchase_train))
+```
+
+#### Weighted k-Nearest Neighbor Regression model
+
+```{r}
+set.seed(32)
+summary(kknn_model <- train.kknn(nexty_total_sales ~ order_num + product_num + total_sales + days_since_last_purchase, 
+                                 data = customer_purchase_train,
+                                 ks = c(2)))
+```
+
+### Predict test data
+```{r}
+testData_glm <- cbind(customer_purchase_test, fit = predict(glm_model, customer_purchase_test, type = "response"))
+testData_mfp <- cbind(customer_purchase_test, fit = predict(mfp_model, customer_purchase_test, type = "response"))
+testData_spline <- cbind(customer_purchase_test, fit = predict(spline_model, customer_purchase_test))
+testData_kknn <- cbind(customer_purchase_test, fit = predict(kknn_model, customer_purchase_test))
+```
+
+#### Get weights for ensemble with minimizing the RMSE
+The ensebmle optimizes for RMSE with a weighted mean calculation of the training results of each model
+
+```{r}
+set.seed(32)
+ens_weights <- optimiseEnsemble(fitted1 = glm_model$fitted.values, 
+                                fitted2 = mfp_model$fitted.values,
+                                fitted3 = spline_model$fitted.values,
+                                fitted4 = unlist(kknn_model$fitted.values),
+                                actual = glm_model$y)$par
+ens_weights
+```
+
+### Calculating differences in predicted and actual data
+We can see, that all models did pretty good (compared to earlier models) both regarding the RMSE and the actual difference
+
+```{r}
+glm_test_RMSE <- calculateRMSEFromFit(testData_glm)
+glm_test_diff <- calculateDiffFromModel(testData_glm)
+glm_test_diff_perc <- calculateDiffFromModel(testData_glm) * 100 / sum(testData_glm$nexty_total_sales)
+print(paste("RMSE:", glm_test_RMSE, ", diff:", glm_test_diff, ",diff(%):", glm_test_diff_perc))
+
+mfp_test_RMSE <- calculateRMSEFromFit(testData_mfp)
+mfp_test_diff <- calculateDiffFromModel(testData_mfp)
+mfp_test_diff_perc <- calculateDiffFromModel(testData_mfp) * 100 / sum(testData_mfp$nexty_total_sales)
+print(paste("RMSE:", mfp_test_RMSE, ", diff:", mfp_test_diff, ",diff(%):", mfp_test_diff_perc))
+
+spline_test_RMSE <- calculateRMSEFromFit(testData_spline)
+spline_test_diff <- calculateDiffFromModel(testData_spline)
+spline_test_diff_perc <- calculateDiffFromModel(testData_spline) * 100 / sum(testData_spline$nexty_total_sales)
+print(paste("RMSE:", spline_test_RMSE, ", diff:", spline_test_diff, ",diff(%):", spline_test_diff_perc))
+
+kknn_test_RMSE <- calculateRMSEFromFit(testData_kknn)
+kknn_test_diff <- calculateDiffFromModel(testData_kknn)
+kknn_test_diff_perc <- calculateDiffFromModel(testData_kknn) * 100 / sum(testData_kknn$nexty_total_sales)
+print(paste("RMSE:", kknn_test_RMSE, ", diff:", kknn_test_diff, ",diff(%):", kknn_test_diff_perc))
+```
+
+From the results we can see, that the ensemble did also pretty good both regarding the RMSE and especially in the accuracy in predicting the next years revenue
+
+```{r}
+testData_ensemble <- data.frame(testData_glm[, c(1:6)],
+                                fit = ensembleFun(testData_glm$fit, testData_mfp$fit, testData_spline$fit, testData_kknn$fit, ens_weights))
+ens_test_RMSE <- calculateRMSEFromFit(testData_ensemble)
+ens_test_diff <- calculateDiffFromModel(testData_ensemble)
+ens_test_diff_perc <- calculateDiffFromModel(testData_ensemble) * 100 / sum(testData_ensemble$nexty_total_sales)
+print(paste("RMSE:", ens_test_RMSE, ", diff:", ens_test_diff, ",diff(%):", ens_test_diff_perc))
+```
+
+Next, we will train for the whole dataset and test the ensemble for some customer groups
+
+### Train on whole dataset
+
+```{r}
+set.seed(32)
+final_model_glm <-glm(nexty_total_sales ~ order_num + product_num + total_sales + days_since_last_purchase,
+                      data = pp_customers_2012)
+set.seed(32)
+final_model_mfp <- mfp(nexty_total_sales ~ fp(order_num) + fp(product_num) + fp(total_sales) + fp(days_since_last_purchase), 
+                        data = pp_customers_2012)
+set.seed(32)
+final_model_spline <- lm(nexty_total_sales ~ bs(order_num) + bs(product_num) + bs(total_sales) + bs(days_since_last_purchase), 
+                                data = pp_customers_2012)
+set.seed(32)
+final_model_kknn <- train.kknn(nexty_total_sales ~ order_num + product_num + total_sales + days_since_last_purchase, 
+                                       data = pp_customers_2012,
+                                       ks = c(2))
+```
+
+### Test customer groups
+We will test on the same two customer groups as before: customers who purchased in december and "onetime" customers (order_num == 1)
+
+#### Dec customers
+Filter december customers, predict next years revenue and optimise ensemble weights
+
+```{r}
+pp_dec_customers <- pp_customers_2012 %>%
+  filter(days_since_last_purchase < 31)
+
+decData_fitted_glm <- cbind(pp_dec_customers, fit = predict(final_model_glm, pp_dec_customers, type = "response"))
+decData_fitted_mfp <- cbind(pp_dec_customers, fit = predict(final_model_mfp, pp_dec_customers, type = "response"))
+decData_fitted_spline <- cbind(pp_dec_customers, fit = predict(final_model_spline, pp_dec_customers))
+decData_fitted_kknn <- cbind(pp_dec_customers, fit = predict(final_model_kknn, pp_dec_customers))
+
+ens_weights <- optimiseEnsemble(fitted1 = final_model_glm$fitted.values, 
+                                fitted2 = final_model_mfp$fitted.values,
+                                fitted3 = final_model_spline$fitted.values,
+                                fitted4 = unlist(final_model_kknn$fitted.values),
+                                actual = final_model_glm$y)$par
+ens_weights
+```
+
+Calculate ensemble result and calculate error, accuracy
+
+```{r}
+decData_fitted_ens <- data.frame(decData_fitted_glm[, c(1:6)],
+                                fit = ensembleFun(decData_fitted_glm$fit, decData_fitted_mfp$fit, decData_fitted_spline$fit, decData_fitted_kknn$fit, 
+                                                  ens_weights))
+
+# Sum of differences, RMSE and % in dec customers
+ens_dec_RMSE <- calculateRMSEFromFit(decData_fitted_ens)
+ens_dec_diff <- calculateDiffFromModel(decData_fitted_ens)
+ens_dec_diff_perc <- calculateDiffFromModel(decData_fitted_ens) * 100 / sum(decData_fitted_ens$nexty_total_sales)
+print(paste("RMSE:", ens_dec_RMSE, ", diff:", ens_dec_diff, ",diff(%):", ens_dec_diff_perc))
+
+```
+
+We can see, that the ensemble model had even better results on this customer group with an almost 100% accuracy :)
+
+### "Onetime" customers
+Filter onetime customers and predict next years revenue
+
+```{r}
+order_min_scaled <- min(pp_customers_2012$order_num)
+onetime_customers <- pp_customers_2012 %>%
+  filter(order_num == order_min_scaled)
+
+
+onetimeData_fitted_glm <- cbind(onetime_customers, fit = predict(final_model_glm, onetime_customers, type = "response"))
+onetimeData_fitted_mfp <- cbind(onetime_customers, fit = predict(final_model_mfp, onetime_customers, type = "response"))
+onetimeData_fitted_spline <- cbind(onetime_customers, fit = predict(final_model_spline, onetime_customers))
+onetimeData_fitted_kknn <- cbind(onetime_customers, fit = predict(final_model_kknn, onetime_customers))
+```
+
+Calculate ensemble result and calculate error, accuracy
+
+```{r}
+onetimeData_fitted_ens <- data.frame(onetimeData_fitted_glm[, c(1:6)],
+                                 fit = ensembleFun(onetimeData_fitted_glm$fit, onetimeData_fitted_mfp$fit, onetimeData_fitted_spline$fit, onetimeData_fitted_kknn$fit,
+                                                   ens_weights))
+
+# Sum of differences, RMSE and % in onetime customers
+ens_onetime_RMSE <- calculateRMSEFromFit(onetimeData_fitted_ens)
+ens_onetime_diff <- calculateDiffFromModel(onetimeData_fitted_ens)
+ens_onetime_diff_perc <- calculateDiffFromModel(onetimeData_fitted_ens) * 100 / sum(onetimeData_fitted_ens$nexty_total_sales)
+print(paste("RMSE:", ens_onetime_RMSE, ", diff:", ens_onetime_diff, ",diff(%):", ens_onetime_diff_perc))
+```
+
+**So far, this is the best model, so we will choose it for prediction and create an interface for accessing it and predict new data with it**
+
+## Save model and related data
+Save preprocessed customer data for both 2012 and 2013
+
+```{r}
+pp_customers_2012 <- data.frame(contact_id = customers_2012[, 1],
+                                predict(pp, customers_2012[, -c(1,7)]),
+                                nexty_total_sales = customers_2012[, 7])
+write.csv(pp_customers_2012, "data/RFM_pp_2012.csv", row.names = F, quote = F)
+
+pp_customers_2013 <- data.frame(contact_id = customer_rfm_2013[, 1],
+                                predict(pp, customer_rfm_2013[, -1]))
+write.csv(pp_customers_2013, "data/RFM_pp_2013.csv", row.names = F, quote = F)
+```
+
+Save models and ensemble weights
+
+```{r}
+saveRDS(final_model_glm, file = "data/model/final_glm.rds")
+saveRDS(final_model_mfp, file = "data/model/final_mfp.rds")
+saveRDS(final_model_spline, file = "data/model/final_spline.rds")
+saveRDS(final_model_kknn, file = "data/model/final_kknn.rds")
+saveRDS(ens_weights, file = "data/model/ens_weights.rds")
+```
+
+## Save results
+
+```{r}
+glm_results <- createModelSummary(description = "Gaussian linear regression, scaled features, formula = nexty_total_sales ~ order_num + product_num + total_sales + days_since_last_purchase",
+                                  test_RMSE = glm_test_RMSE,
+                                  test_diff = glm_test_diff,
+                                  test_diff_percent = glm_test_diff_perc)
+saveRDS(glm_results, file = "data/results/glm.rds")
+
+mfp_results <- createModelSummary(description = "Multiple Fractional Polynomial model, scaled features, formula = nexty_total_sales ~ order_num + product_num + total_sales + days_since_last_purchase",
+                                  test_RMSE = mfp_test_RMSE,
+                                  test_diff = mfp_test_diff,
+                                  test_diff_percent = mfp_test_diff_perc)
+saveRDS(mfp_results, file = "data/results/mfp.rds")
+
+spline_results <- createModelSummary(description = "Polynomial Splines, scaled features, formula = nexty_total_sales ~ order_num + product_num + total_sales + days_since_last_purchase",
+                                    test_RMSE = spline_test_RMSE,
+                                    test_diff = spline_test_diff,
+                                    test_diff_percent = spline_test_diff_perc)
+saveRDS(spline_results, file = "data/results/spline.rds")
+
+kknn_results <- createModelSummary(description = "Polynomial Splines, scaled features, formula = nexty_total_sales ~ order_num + product_num + total_sales + days_since_last_purchase",
+                                   test_RMSE = kknn_test_RMSE,
+                                   test_diff = kknn_test_diff,
+                                   test_diff_percent = kknn_test_diff_perc)
+saveRDS(kknn_results, file = "data/results/kknn.rds")
+
+ens_results <- createModelSummary(description = "Ensemble of (gml, mfp, splines), formula = nexty_total_sales ~ order_num + product_num + total_sales + days_since_last_purchase",
+                                   test_RMSE = ens_test_RMSE,
+                                   test_diff = ens_test_diff,
+                                   test_diff_percent = ens_test_diff_perc,
+                                  dec_test_RMSE = ens_dec_RMSE,
+                                  dec_test_diff = ens_dec_diff,
+                                  dec_test_diff_percent = ens_dec_diff_perc,
+                                  onetime_test_RMSE = ens_onetime_RMSE,
+                                  onetime_test_diff = ens_onetime_diff,
+                                  onetime_test_diff_percent = ens_onetime_diff_perc)
+saveRDS(ens_results, file = "data/results/ens.rds")
+```

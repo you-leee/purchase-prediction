@@ -1,0 +1,58 @@
+---
+title: "Summary"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We will have a quick overview of the results and an example on how to use the fitted model.
+
+## Results of models
+
+```{r message = FALSE, warning = FALSE}
+source("R/utils.R")
+
+model_results <- loadResults()
+printModelResults(model_results)
+
+```
+
+## Revenue predictor example
+The functions for testing on 2012 -> 2013 customer spending and predicting 2013 -> 2014 customer spending can be found in the root folder in the "RevenuePredictor.R" file
+
+```{r message = FALSE, warning = FALSE}
+library(lubridate)
+source("RevenuePredictor.R")
+
+# Get customers, who purchased in 2012 and 2013 november
+group2012 <- purchases %>%
+  filter(year(purchase_date) == 2012 & month(purchase_date) == 11) %>%
+  select(contact_id) %>%
+  unique
+group_2013 <- purchases %>%
+  filter(year(purchase_date) == 2013 & month(purchase_date) == 11) %>%
+  select(contact_id) %>%
+  unique
+
+# Test
+group1_test_results <- testRevenue(group2012$contact_id)
+summary(group1_test_results)
+
+
+# Predict
+group1_pred_results <- predictRevenue(group_2013$contact_id)
+summary(group1_pred_results)
+```
+
+We can see, that the prediction contained some pretty big differences, because in this dataset, the outliner customers are not filtered and the ensemble model is not prepared for them... 
+
+### Some final toughts
+
+* With filtering the outstanding points, the model became pretty accurate, but also "unstable", if a datapoint is not in the normally fitting range, it can make huge errors.. even predict negative revenue.
+* On the other hand, if we did not filter the outstanding points, the model couldn't fit so good for the non-outstanding data.
+* For resolving the negative prediction, I also tried adding a quasi-poisson fitting (it's not included in the code), but it turned out to be unaccurate, so I didn't included it in the model.
+* If this revenue prediction problem has a solution, I think, it includes separating these "high-end" customers from the others and also those customers, who were spending a lot this year, but didn't purchased anything next year
+
+
