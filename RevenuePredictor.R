@@ -1,3 +1,10 @@
+# Install required packages
+required_packages <- c("mfp", "splines", "kknn", "dplyr", "caret", "doParallel")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) {
+  install.packages(new_packages)
+}
+
 library(mfp)
 library(splines)
 library(kknn)
@@ -55,7 +62,7 @@ testRevenue <- function(customer_ids, verbose = TRUE) {
     ens_test_diff <- sum(testData_ensemble$fit - group_nexty_total_sales)
     ens_test_diff_perc <- ens_test_diff * 100 / sum(group_nexty_total_sales)
     cat(paste0("Predicted revenue: ", sum(testData_ensemble$fit), 
-                 "\nRMSE: ", ens_test_RMSE, ", diff: ", ens_test_diff, ", diff(%): ", ens_test_diff_perc))
+                 "\nRMSE: ", ens_test_RMSE, ", diff: ", ens_test_diff, ", diff(%): ", ens_test_diff_perc, "\n"))
   }
   
   testData_ensemble
@@ -82,7 +89,7 @@ predictRevenue <- function(customer_ids, verbose = TRUE) {
                                        fit = ensembleFun(predictedData_glm$fit, predictedData_mfp$fit, predictedData_spline$fit, predictedData_kknn$fit,
                                                      weights = ens_weights))
   if(verbose) {
-    cat(paste0("Predicted revenue: ", sum(predictedData_ensemble$fit)))
+    cat(paste0("Predicted revenue: ", sum(predictedData_ensemble$fit), "\n"))
   }
   
   predictedData_ensemble
